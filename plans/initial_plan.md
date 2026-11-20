@@ -1,6 +1,6 @@
-# Initial Plan: LLM Text-Watermark Accelerator
+# Initial Plan: Watermarking Sampler for LLM Text
 
-Repository: **TODO — GitHub URL of this repo**
+Repository: https://github.com/FAAMT/llm-watermark-ip
 
 ## Project Team
 
@@ -11,226 +11,224 @@ Repository: **TODO — GitHub URL of this repo**
 
 ### What the IP does
 
-A language model emits text one token at a time by sampling from a distribution
-over a vocabulary of V tokens. A statistical text watermark nudges that sampling so
-the chosen tokens carry a hidden, machine-detectable signal while the text reads
-normally; detection needs only the token sequence and the secret key, not the
-model. Because each token's mark depends only on the k tokens before it, copy-paste
-and light edits damage one window each, while a full rewrite removes it.
+A language model picks each next token by sampling from `softmax(ℓ)` over the
+logits ℓ of a V-token vocabulary. This IP is that sampler, with its randomness
+derived from a secret key and the previous k tokens. The text therefore carries a
+statistical watermark that anyone holding the key can detect from the tokens
+alone, without the model.
 
-The IP is a streaming hardware block for the soft red/green-list watermark of
-Kirchenbauer et al. (ICML 2023). Google DeepMind's SynthID-Text (Dathathri et al.,
-Nature 2024) uses the same keyed context hash but steers the sampler by tournament
-rather than biasing logits. The IP sits between the model's output logits and the
-sampler, with three modes:
+One keyed uniform u per candidate token drives two published schemes, chosen at
+CONFIG:
 
-- **Mode 0, mask** — given the previous k token ids, emit the V-bit green mask for
-  the next step. This is the deployment path: 6.3 KB out per step, and the host
-  adds δ in float where the mask is set.
-- **Mode 1, bias** — also take the V logits as int16, add δ to the green ones,
-  return them. The whole pipeline in hardware, for demonstration.
-- **Mode 2, detect** — take a finished token sequence, return the green count and
-  the length; the host computes the z-score.
+- **GUMBEL** (default): Aaronson's scheme, also called exponential-minimum
+  sampling (Kuditipudi et al.). The IP returns `argmax_t (ℓ_t + G(u_t))` with
+  Gumbel noise G. Over a random key this is a softmax sample up to ROM
+  quantisation (the Gumbel-max trick), so the text distribution is unchanged.
+- **GREEN**: the soft red/green list of Kirchenbauer et al. Tokens whose u falls
+  in the top γ fraction are green and gain δ on their logit; the IP then samples
+  with Gumbel noise from an unkeyed seed. It shifts the distribution slightly, and
+  in the MarkMyWords benchmark (Piet et al.) it is detectable in under 100 tokens.
 
-The IP stores neither the vocabulary nor the model and is parameterised by V. The
-demonstration target is GPT-2 small (V = 50257), with logits recorded offline from
-the Hugging Face model and replayed by the PS, or by the C testbench in simulation.
+The detector recomputes u for each token actually chosen and returns two
+statistics in one pass: the Gumbel score S and the green count g. Green means
+"high u", and Gumbel sampling favours high u, so each statistic responds to both
+schemes; detection power falls with the entropy of the text, as for any
+sampling watermark.
+
+- **SAMPLE:** context and V logits in, sampled token out.
+- **DETECT:** token sequence in; S, g and the count N out. The host turns them
+  into p-values.
+- **MASK** (stretch goal): context in, the V-bit green mask out, for a host that
+  samples on its own.
+
+The model (GPT-2 small, V = 50,257) runs in Python with Hugging Face. Its logits
+are recorded and replayed by the testbench, and the model weights are never
+changed.
 
 ### Mathematical operations
 
-Fixed per deployment: a 64-bit secret key K, green fraction γ (default 0.25), bias
-δ (default 2.0), context length k (default 1, up to 4). Token ids are 32-bit
-unsigned. Logits are int16 in Q8.8 after the host subtracts the maximum (softmax is
-shift-invariant) and clamps.
+CONFIG fixes a 64-bit key K, V, the context length k (1–4), a 64-bit nonce, the
+scheme, γ (sent as the threshold θ = 2^32 − ⌊γ·2^32⌋) and δ (Q8.8). Logits are
+int16 Q8.8 in natural-log units; the host scales by 1/temperature, subtracts the
+maximum and clamps. fmix64 and fmix32 are the MurmurHash3 finalisers;
+C_1..C_4 are the odd 64-bit constants `C_CTX` in `src/golden/wm_ref.py`.
 
-1. **Step seed**, once per generated token i:
-   `s_i = fmix64( K ⊕ ⊕_{j=1..k} ((t_{i−j} + 1) · C_j mod 2^64) )`
-   fmix64 is the MurmurHash3 64-bit finaliser (two multiplies by constants, three
-   xor-shifts); C_1..C_4 are fixed odd 64-bit constants.
-2. **Green test**, once per vocabulary index t ∈ [0, V):
-   `g_i(t) = 1[ fmix32( s_i[31:0] ⊕ (t · 0x9E3779B1 mod 2^32) ) < ⌊γ · 2^32⌋ ]`
-   fmix32 is the 32-bit finaliser: two constant multiplies, three xor-shifts, one
-   unsigned compare. The V tests share no data.
-3. **Bias** (mode 1): `ℓ'_t = sat16( ℓ_t + δ_Q8.8 · g_i(t) )`; the host samples
-   `t_i ~ softmax(ℓ')` or takes the argmax.
-4. **Detection** (mode 2) over T tokens, N = T − k:
-   `g = Σ_{i>k} g_i(t_i)`,  `z = (g − γN) / sqrt(N · γ · (1 − γ))`.
-   z ≥ 4 declares the text watermarked; the one-sided false-positive rate under the
-   null is about 3·10⁻⁵.
+1. **Seeds**, once per step: `s = fmix64(K ⊕ ⊕_j ((t_{i−j} + 1)·C_j mod 2^64))`
+   from the previous k tokens, and the unkeyed `s_f = fmix64(nonce ⊕ ((step + 1)·C_4 mod 2^64))`.
+2. **Uniforms**, per index t: `u_t = fmix32(s[31:0] ⊕ (t·0x9E3779B1 mod 2^32))`,
+   read as `ũ = (u + 0.5)/2^32`; `u'_t` is the same from `s_f`.
+3. **Noise:** `G(ũ) = −ln(−ln ũ)`, read from a ROM in Q8.8 (range −3.13 to 22.87).
+4. **Sample**, ties to the smallest t:
+   - GUMBEL: `argmax_t (ℓ_t + G(u_t))`, with `u'_t` instead on a repeated context.
+   - GREEN: `argmax_t (ℓ_t + δ·[u_t ≥ θ] + G(u'_t))`.
+5. **Detect**, over tokens i ≥ k not flagged as repeated:
+   `S = Σ −ln(1 − ũ)` (ROM, Q5.11), `g = Σ [u ≥ θ]`, N = tokens scored. For
+   unwatermarked text each score is Exp(1), so `S ~ Gamma(N, 1)` and
+   `p_S = gammaincc(N, S)` (Fernandez et al.); and `g ~ Binomial(N, γ)`, so
+   `p_g = P[Binomial(N, γ) ≥ g]`. Text is watermarked if p < 10⁻⁶.
+6. **Repeated contexts:** when a k-token context has already appeared in the text,
+   the host sets a free bit. Generation uses `s_f` and detection skips the token,
+   so noise never repeats and both p-values stay exact.
 
-One deliberate deviation: Kirchenbauer et al. take the green list as the first γV
-entries of a seeded random permutation of the vocabulary; we hash each index
-independently. The detection statistic is unchanged, since each token is green with
-probability γ independently of its logit; only the green count per step becomes
-Binomial(V, γ) instead of exactly γV, which the z-test does not use. In exchange
-the computation becomes parallel: a permutation needs O(V) memory and a serial
-pass, the hash needs neither.
+**ROM address.** Take w, the distance of u from the nearer end of [0, 2^32); e,
+its leading-zero count; m, the 8 bits after its leading one. The address is
+`(half·33 + e)·256 + m`, 16,896 entries. This works like a small floating-point
+number and stays accurate in both tails, where winning tokens come from. A table
+on the top 16 bits of u would clip u > 1 − 2^−16, which on average 0.77 tokens
+out of 50,257 reach at every step, and those are the likely winners.
 
-Golden model (full file `src/golden/wmark_ref.py`; a numpy array stands in for the
-lane array):
+Outline of the golden model; the bit-exact file is `src/golden/wm_ref.py`:
 
 ```python
-M32, M64 = (1 << 32) - 1, (1 << 64) - 1
-C_IDX = 0x9E3779B1                                   # odd, so t -> t*C_IDX is a bijection mod 2^32
-C_CTX = (0x9E3779B97F4A7C15, 0xBF58476D1CE4E5B9, 0x94D049BB133111EB, 0x2545F4914F6CDD1D)
+def sample(ctx, logits, free, step):                            # SAMPLE
+    u  = uniforms(step_seed(K, ctx), range(V))                  # keyed: hash_lanes
+    uf = uniforms(free_seed(nonce, step), range(V))             # unkeyed: hash_lanes
+    if scheme == GUMBEL:
+        v = logits + G_ROM[pf_index(uf if free else u)]
+    else:                                                       # GREEN
+        v = logits + delta * (u >= theta) + G_ROM[pf_index(uf)]
+    return argmax(v)                                            # first maximum
 
-def fmix64(k):                                       # MurmurHash3 64-bit finaliser
-    k ^= k >> 33; k = (k * 0xFF51AFD7ED558CCD) & M64
-    k ^= k >> 33; k = (k * 0xC4CEB9FE1A85EC53) & M64
-    return k ^ (k >> 33)
-
-def fmix32_vec(h):                                   # 32-bit finaliser on a uint32 array = P lanes
-    h = h ^ (h >> np.uint32(16)); h = h * np.uint32(0x85EBCA6B)
-    h = h ^ (h >> np.uint32(13)); h = h * np.uint32(0xC2B2AE35)
-    return h ^ (h >> np.uint32(16))
-
-def step_seed(key, ctx):                             # seed_unit: ctx = previous k ids, oldest first
-    x = key
-    for j, t in enumerate(reversed(ctx)):
-        x ^= ((t + 1) * C_CTX[j]) & M64
-    return fmix64(x)
-
-def green_mask(seed, V, gamma):                      # hash_lanes: V independent hashes -> V bits
-    thr, s_lo = np.uint32(int(gamma * 2**32)), np.uint32(seed & M32)
-    t = np.arange(V, dtype=np.uint32)
-    return fmix32_vec((t * np.uint32(C_IDX)) ^ s_lo) < thr
-
-def bias_logits(q, mask, delta_q88):                 # logit_biaser: saturating int16 add
-    return np.clip(q.astype(np.int32) + delta_q88 * mask, -32768, 32767).astype(np.int16)
-
-def detect(key, tokens, V, gamma, k):                # detect_acc, then the host's z-score
-    g = sum(green_mask(step_seed(key, tokens[i-k:i]), V, gamma)[tokens[i]]
-            for i in range(k, len(tokens)))
-    N = len(tokens) - k
-    return g, N, (g - gamma * N) / math.sqrt(N * gamma * (1 - gamma))
+def detect(tokens, skip):                                       # DETECT
+    S = g = N = 0
+    for i in range(k, len(tokens)):
+        if skip[i]: continue
+        u = uniforms(step_seed(K, tokens[i-k:i]), [tokens[i]])
+        S += S_ROM[pf_index(u)]; g += (u >= theta); N += 1
+    return S, g, N                     # host: gammaincc(N, S/2048) and binom.sf(g-1, N, gamma)
 ```
 
 ### Why it suits hardware acceleration
 
-- **Highly parallel.** Each step needs V ≈ 50k independent keyed hashes with no
-  data dependence. P lanes evaluate P indices per clock at an initiation interval
-  of 1. At 100 MHz, P = 16 takes ⌈V/16⌉ = 3,142 cycles ≈ 31 µs per step; P = 32
-  takes 1,571 cycles ≈ 16 µs and about 192 DSP48E1 of the xc7z020's 220 (two 32-bit
-  constant multiplies per lane, three DSPs each), the device's ceiling. The index
-  multiply is not a multiplier: each lane adds P·C to an accumulator every cycle.
-- **Latency-critical.** The watermark runs inside the autoregressive decode loop,
-  once per generated token, so its latency adds directly to per-token latency. A
-  software pass of 50k 32-bit hashes on the Zynq's Cortex-A9 is estimated at about
-  a millisecond per token (measured, not assumed, in milestone 1). The cycle counts
-  above are mode-0 figures; mode 1 is bounded by the 64-bit stream at
-  ⌈V/4⌉ = 12,565 beats ≈ 126 µs per step for any P ≥ 4, which is why mode 0 is the
-  deployment path.
-- **Integer-only and stateless.** Every operation is a multiply by a constant,
-  XOR, shift, compare or 16-bit saturating add. The state is the key, one seed and
-  two counters; no memory scales with V.
+- **Sampling without softmax.** V additions and one running maximum replace V
+  exponentials, a sum, a normalisation and a search: one integer-only streaming
+  pass, the same pass for both schemes.
+- **Highly parallel.** The V hashes and ROM lookups are independent; P lanes run
+  at II = 1 and feed a P-input max tree.
+- **Latency-critical.** It runs once per generated token, inside the decode loop,
+  so its latency adds to every token.
+- **Small, fixed state.** The key, two seeds and a running maximum. The ROMs are
+  fixed and nothing grows with V.
+- **Parallel detection.** Every token's seed depends only on input tokens, so P_d
+  detector lanes score P_d tokens per clock.
 
-### How it interacts with the PS
+### How it talks to the host
 
-The PS configures the IP over AXI4-Lite and moves bulk data with the AMD AXI DMA
-over two 64-bit AXI4-Stream channels. In modes 0 and 1 the PS writes the previous
-token ids, pulses start, and runs one DMA packet per step: logits in and biased
-logits out in mode 1, the mask out in mode 0. In mode 2 the PS streams the token
-sequence in and reads the green count and length from registers once done is set.
-Completion is a status bit and an optional interrupt.
+The course command-response pattern: one 64-bit AXI4-Stream in for commands and
+data, one 64-bit AXI4-Stream out for responses, and AXI-Lite for status only
+(halted, error code, tx_id). On PYNQ an AMD AXI DMA drives both streams.
+
+| Command | Header | Data after the header | Response |
+|---|---|---|---|
+| CONFIG (0) | K, V, k, nonce, scheme, θ, δ | none | none |
+| SAMPLE (1) | free bit, step, k context ids | ⌈V/4⌉ beats of 4 int16 logits, TLAST on the last | header, then token id and its winning value |
+| DETECT (2) | T | ⌈T/2⌉ beats of 2 words (bits 23:0 token id, bit 31 skip), TLAST on the last | header, then S (Q21.11) and N, then g |
+| END (3) | none | none | none; the kernel returns |
+| MASK (4), stretch | k context ids | none | header, then ⌈V/64⌉ beats; bit b of beat w is token 64w + b |
 
 ## IP Architecture
 
 ```
-mode 0  PS ─AXI4-Lite─► ctrl_regs ─► seed_unit ─s_lo─► hash_lanes[P] ─P bits─► mask_packer ─► axis_out ═DMA S2MM═► DDR
-mode 1  DDR ═DMA MM2S═► axis_in ─logits─► logit_biaser ◄─4 bits/beat─ hash_lanes[P];  logit_biaser ─► axis_out ═► DDR
-mode 2  DDR ═DMA MM2S═► axis_in ─token id─► hash_lanes[0] (s_lo reseeded per token by seed_unit) ─1 bit─► detect_acc ─G, N─► ctrl_regs ─► PS
+SAMPLE  in ─► controller ─► seed_unit ─s, s_f─► hash_lanes[P] ─u, u', green─► rom_index[P] ─► gumbel_rom ─G─┐
+                 └─► logit_unpack ─ℓ, 4 per beat──────────────────────────────────────────────► add_argmax ─► resp ─► out
+DETECT  in ─► controller ─► ctx_shift ─► detect_lanes[P_d] (fmix64 ► fmix32 ► rom_index ► score_rom, green) ─► score_acc ─► resp ─► out
 ```
 
 ### Sub-modules
 
-1. **ctrl_regs** — AXI4-Lite register file: `KEY` (2 × 32, write-only),
-   `GAMMA_THR` (⌊γ·2^32⌋), `DELTA` (Q8.8), `VOCAB`, `CTX_K`, `MODE`, `CTX0..3`
-   (previous token ids), `CTRL` (start), `STATUS` (busy, done), `G_COUNT`,
-   `N_COUNT`. No datapath.
-2. **seed_unit** — folds K with the context tokens and runs fmix64 once per step,
-   multi-cycle, off the critical path. In mode 2 it shifts each incoming token id
-   into a k-deep context register and reseeds, holding the input stream for the
-   six or so cycles this takes.
-3. **hash_lanes** — P identical pipelined lanes. Lane p in cycle c evaluates index
-   t = cP + p: accumulator step, XOR with `s_lo`, fmix32, compare with
-   `GAMMA_THR`, one green bit; lanes with t ≥ `VOCAB` output zero. In mode 2 lane 0
-   takes its index from the incoming token id instead of the counter. P is a
-   compile-time parameter set from the resource report.
-4. **mask_packer** (mode 0) — packs P bits per cycle into 64-bit beats, zero-pads
-   the final beat, asserts TLAST.
-5. **logit_biaser** (mode 1) — unpacks four int16 logits per beat, adds `DELTA`
-   with saturation where the four matching green bits are set, repacks. One beat
-   per cycle, so it takes a 4-bit slice of the lane results per cycle and the lanes
-   stall otherwise.
-6. **detect_acc** (mode 2) — per token, takes lane 0's green bit under that
-   position's seed, accumulates `G_COUNT` and `N_COUNT`, raises done at TLAST.
-7. **axis_in / axis_out** — AXI4-Stream slave and master ports with skid buffers
-   and TLAST framing.
+1. **controller:** parses CONFIG, SAMPLE, DETECT and END headers, checks errors in
+   the course's order, holds the configuration and writes the AXI-Lite status.
+2. **seed_unit:** computes the keyed seed s and the unkeyed seed s_f once per
+   SAMPLE with a multi-cycle fmix64, off the critical path.
+3. **hash_lanes (P copies):** lane p handles index t = cP + p. Two pipelined
+   fmix32 per lane give u and u'. The index multiply is an accumulator adding
+   P·0x9E3779B1 each cycle, and one comparator gives the green bit `u ≥ θ`.
+4. **rom_index (P copies):** a mux picks u or u' from the scheme and the free bit,
+   then a leading-zero count and a shift give the ROM address. Logic only.
+5. **gumbel_rom:** the 16,896 × 16-bit table, about 9 BRAM36. Two lanes share each
+   dual-port copy.
+6. **logit_unpack:** splits each 64-bit beat into 4 int16 logits and forces
+   indices past V to −32768, whatever the host sent. A pad cannot win, because
+   the host's max subtraction puts one real logit at 0.
+7. **add_argmax:** P additions `ℓ + δ·green + G` in 18 bits (δ is gated by the
+   scheme), a P-input max tree, and a running maximum with its index across beats.
+8. **ctx_shift + detect_lanes (P_d copies):** a shift register gives each lane its
+   token and k previous tokens. Each lane has a pipelined fmix64 and fmix32,
+   rom_index and the green comparator; the two lanes share one dual-port score
+   ROM (Q5.11). Skipped tokens add 0.
+9. **score_acc:** adder trees over the P_d lanes and 32-bit accumulators for S, g
+   and N.
+10. **resp:** builds the response header and payload beats.
+
+The MASK stretch adds **mask_packer**, which packs green bits into 64-bit beats.
 
 ### Interfaces
 
-| From → To | Interface | What it carries |
+| From → To | Type | What it carries |
 |---|---|---|
-| PS → ctrl_regs | AXI4-Lite, 32-bit | key, γ threshold, δ, V, k, mode, previous token ids, start |
-| ctrl_regs → PS | AXI4-Lite reads, IRQ | busy / done, `G_COUNT`, `N_COUNT` |
-| ctrl_regs → every block | static registers | `GAMMA_THR`, `VOCAB`, `DELTA`, `MODE`, `CTX_K` |
-| ctrl_regs → seed_unit | register bus, start pulse | K, `CTX0..3` |
-| seed_unit → hash_lanes | 32-bit `s_lo` + valid | the step seed |
-| DDR → axis_in → logit_biaser | AXI4-Stream slave, 64-bit, AXI DMA MM2S | mode 1: 4 × int16 Q8.8 logits per beat, ⌈V/4⌉ beats, TLAST per step |
-| DDR → axis_in → seed_unit, hash_lanes | same channel, one 32-bit id per beat + valid | mode 2: the token to score, T beats, TLAST per sequence; seed_unit shifts it into the context, lane 0 hashes it under the previous seed |
-| hash_lanes → mask_packer | `hls::stream`, P bits per cycle, ready/valid | green bits for indices cP … cP+P−1 |
-| hash_lanes → logit_biaser | `hls::stream`, 4 bits per beat (P:4 slice) | green bits for the four logits in the beat |
-| hash_lanes → detect_acc | 1 bit + valid | g_i(t_i) for the current token |
-| mask_packer / logit_biaser → axis_out → DDR | AXI4-Stream master, 64-bit, AXI DMA S2MM | mode 0: ⌈V/64⌉ beats, bit b of beat w is token 64w+b, bits ≥ V zero · mode 1: biased logits in the input format |
+| PS → controller | AXI4-Stream in, 64-bit | command headers with tx_id, then logits or token words, ending in TLAST |
+| resp → PS | AXI4-Stream out, 64-bit | response header (tx_id, word count), then token and value, or S, g and N |
+| controller → PS | AXI-Lite | halted, error code, tx_id |
+| controller → seed_unit | FIFO (`hls::stream`) | K, nonce, k context ids, step and free bit, once per SAMPLE |
+| seed_unit → rom_index | FIFO, once per SAMPLE | the free bit, which with the scheme selects u or u' |
+| controller → hash_lanes, rom_index, add_argmax, ctx_shift, detect_lanes | registers, static during a command | K (to detect_lanes), scheme, θ, δ, V, k |
+| seed_unit → hash_lanes | FIFO | s[31:0] and s_f[31:0] |
+| hash_lanes → rom_index | FIFO, P per cycle | u, u' (32-bit each) and the green bit |
+| rom_index → gumbel_rom | BRAM read port, one per lane, two lanes per dual-port copy | 15-bit address in, 16-bit G (Q8.8) out after a fixed latency |
+| gumbel_rom → add_argmax | FIFO, P per cycle | G, with the green bit delayed alongside it |
+| controller → logit_unpack → add_argmax | FIFO | 64-bit beats, then P int16 logits per cycle |
+| controller → ctx_shift → detect_lanes | FIFO | token words, then (context, token, skip) per lane |
+| detect_lanes → score_acc | FIFO, P_d per cycle | score (uint16 Q5.11) and green bit |
+| add_argmax, score_acc → resp | FIFO | result words |
 
-Flow control is ready/valid end to end: if the DMA cannot accept output, TREADY
-falls and the lanes hold their counters; nothing is dropped and no buffer grows.
-logit_biaser accepts one beat per cycle, the stream's maximum. detect_acc accepts
-one token per reseed, about six cycles, holding TREADY meanwhile; at roughly
-15 Mtoken/s a 10k-token document scores in under a millisecond, so the reseed, not
-the bus, bounds mode 2. In mode 1 the host pads the input to a whole beat and
-ignores the surplus lanes. The IP has no AXI master; the AXI DMA does all memory
-movement.
+No shared memory is used and the IP has no AXI master. The top level is an HLS
+dataflow region with ready/valid flow control throughout, so a stalled output
+stream stops the lanes without dropping data.
 
 ### Why this decomposition
 
-- **One scaling knob, one hash.** Only hash_lanes grows with P; the other six
-  blocks are small and fixed, and it is the only place the hash function appears.
-  MurmurHash3 is a mixer, not a PRF, so the key in its write-only register is a
-  convenience, not a security property; if secrecy matters, SipHash is a
-  one-module swap.
-- **Every block has a line in the golden model**: seed_unit ↔ `step_seed`,
-  hash_lanes ↔ `green_mask`, logit_biaser ↔ `bias_logits`, detect_acc ↔ `detect`.
-  Each is one C++ function with its own C testbench against the matching Python
-  function; the top level is an HLS dataflow region joining them with
-  `hls::stream`.
-- **The modes build incrementally.** ctrl_regs + seed_unit + hash_lanes +
-  mask_packer is a complete mode-0 IP that runs end to end first; mode 1 adds
-  logit_biaser, mode 2 adds detect_acc. Rejected on the way: a permutation-based
-  green list (O(V) memory, serial) and softmax plus multinomial sampling on chip
-  (doubles the design for no gain in watermark correctness; argmax on chip is a
-  stretch goal).
+- **One front end, two schemes.** seed_unit and hash_lanes serve both schemes and
+  the detector. GREEN costs a second fmix32 and a comparator per lane and one
+  adder input, not a second datapath.
+- **One golden function per block:** seed_unit ↔ `step_seed`/`free_seed`,
+  hash_lanes ↔ `uniforms`, rom_index ↔ `pf_index`, add_argmax ↔ `sample`,
+  detect_lanes and score_acc ↔ `detect`. Each gets its own C testbench.
+- **Incremental build.** GUMBEL SAMPLE at P = 1 runs end to end first, then
+  P = 4, then DETECT, then GREEN, then the MASK stretch. Each step leaves a
+  working IP.
+- **Scaling knobs.** The stream width sets both: P = W/16 logits and P_d = W/32
+  tokens per beat. The DSP budget is the ceiling on each.
+
+### Expected performance
+
+- **SAMPLE** is bandwidth-bound: 4 logits per 64-bit beat, so P = 4 and
+  ⌈50,257/4⌉ = 12,565 cycles, about 126 µs per token at 100 MHz, for either
+  scheme.
+- **DETECT** takes 2 tokens per beat with P_d = 2 at II = 1.
+- **MASK** (stretch) is compute-bound. It runs all 8 fmix32 units on the keyed
+  seed (a seed mux, an index stride of 8 and a comparator on each unit), taking ⌈50,257/8⌉ = 6,283 cycles, about 63 µs, and sends 6.3 KB out
+  instead of 100 KB of logits in.
+- **Resource estimate** on the `xc7z020`, to be replaced by synthesis: about
+  110–150 of 220 DSP48E1 (detect lanes also multiply each context id and the
+  token id by constants) and 27 of 140 BRAM36.
+- **Verification:** bit-exact C simulation and co-simulation against the golden
+  model; a χ² test that samples match softmax(ℓ), or softmax(ℓ + δ·green) in
+  GREEN; uniform p-values on unwatermarked text; a NumPy software baseline.
 
 ### Existing IP
 
-AMD AXI DMA for the two stream channels, AXI SmartConnect for the AXI4-Lite port,
-the AXI4-Stream Data FIFO if the DMA needs decoupling, and the AXI4-Stream Data
-Width Converter in place of mask_packer's own packing if P is byte-aligned. We know
-of no AMD core for the hash lanes; if the grader suggests one we will evaluate it.
+AMD AXI DMA for the two streams, and the AXI4-Stream Data FIFO for decoupling if
+needed. We considered the AMD Floating-Point Operator (log) and CORDIC for G(u)
+and rejected them: two logarithms per lane cost more DSPs and latency than one
+ROM read. We know of no AMD core for the keyed hash.
 
-### Scope
+## References
 
-Target `xc7z020clg400-1` (PYNQ-Z2) at 100 MHz, Vitis HLS C++, bit-exact C
-simulation against the Python golden model; PYNQ deployment is a stretch. Out of
-scope: sampling on chip beyond argmax, a multi-bit payload, running the language
-model on the PS.
+- S. Aaronson, "My AI Safety Lecture for UT Effective Altruism," *Shtetl-Optimized*, 2022.
+- R. Kuditipudi, J. Thickstun, T. Hashimoto, P. Liang, "Robust Distortion-free Watermarks for Language Models," TMLR 2024, arXiv:2307.15593.
+- J. Kirchenbauer et al., "A Watermark for Large Language Models," ICML 2023, arXiv:2301.10226.
+- P. Fernandez et al., "Three Bricks to Consolidate Watermarks for Large Language Models," WIFS 2023, arXiv:2308.00113.
+- J. Piet et al., "Mark My Words: Analyzing and Evaluating Language Model Watermarks," arXiv:2312.00273.
+- A. Appleby, MurmurHash3 (public domain): the fmix32 and fmix64 finalisers.
 
-### References
-
-- J. Kirchenbauer, J. Geiping, Y. Wen, J. Katz, I. Miers, T. Goldstein, "A
-  Watermark for Large Language Models," ICML 2023. arXiv:2301.10226.
-- J. Kirchenbauer et al., "On the Reliability of Watermarks for Large Language
-  Models," 2023. arXiv:2306.04634 (k = 1 seeding is the most edit-robust).
-- S. Dathathri et al., "Scalable watermarking for identifying large language
-  model outputs," Nature 634, 818–823 (2024). SynthID-Text.
-- A. Appleby, MurmurHash3, public domain: the `fmix32` and `fmix64` finalisers.
+The design history (two plans and their merge) is in `plans/design_review.md`.
