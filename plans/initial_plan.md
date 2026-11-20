@@ -4,8 +4,8 @@ Repository: **TODO — GitHub URL of this repo**
 
 ## Project Team
 
-- Fahad Tajiki (NetID **TODO**)
-- **TODO: partner's full name** (NetID **TODO**)
+- Fahad Tajiki (fxt2021)
+- Krish Mehta (km6152)
 
 ## IP Definition
 

@@ -12,4 +12,4 @@ what exists; it will be rewritten to describe what was actually built.
 | `plans/initial_plan.md` | the initial plan — graded, 20 points |
 | `src/golden/wmark_ref.py` | bit-exact Python reference for every block in the plan; `python3 src/golden/wmark_ref.py` runs a demo: on synthetic logits the detector reports z ≈ +14 with the watermark on and ≈ 0 off |
 
-Team: Fahad Tajiki and **TODO: partner**.
+Team: Fahad Tajiki (fxt2021) and Krish Mehta (km6152).
