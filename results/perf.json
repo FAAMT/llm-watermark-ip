@@ -1,0 +1,96 @@
+{
+ "sample": [
+  {
+   "V": 4,
+   "beats": 1,
+   "latency": 27,
+   "overhead": 26,
+   "us": 0.27,
+   "data_phase": -1,
+   "ok": true
+  },
+  {
+   "V": 64,
+   "beats": 16,
+   "latency": 42,
+   "overhead": 26,
+   "us": 0.42,
+   "data_phase": -1,
+   "ok": true
+  },
+  {
+   "V": 1024,
+   "beats": 256,
+   "latency": 282,
+   "overhead": 26,
+   "us": 2.82,
+   "data_phase": -1,
+   "ok": true
+  },
+  {
+   "V": 4096,
+   "beats": 1024,
+   "latency": 1050,
+   "overhead": 26,
+   "us": 10.5,
+   "data_phase": -1,
+   "ok": true
+  },
+  {
+   "V": 50257,
+   "beats": 12565,
+   "latency": 12591,
+   "overhead": 26,
+   "us": 125.91,
+   "data_phase": -1,
+   "ok": true
+  },
+  {
+   "V": 151936,
+   "beats": 37984,
+   "latency": 38010,
+   "overhead": 26,
+   "us": 380.1,
+   "data_phase": -1,
+   "ok": true
+  }
+ ],
+ "detect": [
+  {
+   "T": 2,
+   "beats": 1,
+   "latency": 20,
+   "overhead": 19,
+   "us": 0.2,
+   "tokens_per_cycle": 0.1,
+   "ok": true
+  },
+  {
+   "T": 64,
+   "beats": 32,
+   "latency": 51,
+   "overhead": 19,
+   "us": 0.51,
+   "tokens_per_cycle": 1.2549019607843137,
+   "ok": true
+  },
+  {
+   "T": 1024,
+   "beats": 512,
+   "latency": 531,
+   "overhead": 19,
+   "us": 5.31,
+   "tokens_per_cycle": 1.9284369114877589,
+   "ok": true
+  },
+  {
+   "T": 16384,
+   "beats": 8192,
+   "latency": 8211,
+   "overhead": 19,
+   "us": 82.11,
+   "tokens_per_cycle": 1.9953720618682256,
+   "ok": true
+  }
+ ]
+}

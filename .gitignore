@@ -1,6 +1,11 @@
+# simulation and tool outputs: nothing generated is committed except results/
+build/
+.venv/
 **/__pycache__/
-**/*.log
-**/prj_*/
 **/.Xil/
-**/*.jou
-**/.vscode/
+*.jou
+*.log
+*.vvp
+*.vcd
+*.str
+.Xil/

@@ -1,0 +1,6 @@
+# Open-source synthesis of wm_top to Xilinx 7-series primitives (LUT6, FDRE,
+# DSP48E1, RAMB36E1); resource counts only, no timing.
+#   make synth-yosys
+read_verilog src/rtl/wm_util.v src/rtl/seed_unit.v src/rtl/sample_core.v src/rtl/detect_core.v src/rtl/axil_ctrl.v src/rtl/wm_top.v
+synth_xilinx -family xc7 -top wm_top -flatten
+tee -o results/synth/yosys/stat.txt stat

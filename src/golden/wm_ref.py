@@ -100,14 +100,15 @@ G_ROM, S_ROM = build_roms()
 
 
 def sample(key, ctx, logits_q88, scheme=GUMBEL, gamma=0.25, delta_q88=512,
-           free=False, nonce=0, step=0):                              # SAMPLE command
+           free=False, nonce=0, step=0, theta=None):                  # SAMPLE command
     V = len(logits_q88)
     v = logits_q88.astype(np.int32)
     u_free = uniforms(free_seed(nonce, step), range(V))
     if scheme == GUMBEL:
         u_noise = u_free if free else uniforms(step_seed(key, ctx), range(V))
     else:                                                             # GREEN
-        v = v + delta_q88 * green(uniforms(step_seed(key, ctx), range(V)), green_thr(gamma))
+        thr = green_thr(gamma) if theta is None else theta            # CONFIG may give theta directly
+        v = v + delta_q88 * green(uniforms(step_seed(key, ctx), range(V)), thr)
         u_noise = u_free
     v = v + G_ROM[pf_index(u_noise)]
     t = int(np.argmax(v))                                             # first maximum: smallest index wins
@@ -118,8 +119,9 @@ def mask(key, ctx, V, gamma=0.25):                                    # MASK com
     return green(uniforms(step_seed(key, ctx), range(V)), green_thr(gamma))
 
 
-def detect(key, tokens, skip, k, gamma=0.25):                         # DETECT: S (Q21.11), g, N
-    thr, S, g, N = green_thr(gamma), 0, 0, 0
+def detect(key, tokens, skip, k, gamma=0.25, theta=None):             # DETECT: S (Q21.11), g, N
+    thr = green_thr(gamma) if theta is None else theta
+    S, g, N = 0, 0, 0
     for i in range(k, len(tokens)):
         if skip[i]: continue
         u = uniforms(step_seed(key, tokens[i - k:i]), [tokens[i]])

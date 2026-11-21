@@ -1,0 +1,21 @@
+{
+ "cpu": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+ "rows": [
+  {
+   "V": 50257,
+   "c_us": 134.592,
+   "numpy_us": 3804.3257780373096,
+   "ip_us": 125.91,
+   "ip_cycles": 12591,
+   "detect_c_ns_per_token": 4.28
+  },
+  {
+   "V": 151936,
+   "c_us": 293.872,
+   "numpy_us": 11571.682151407003,
+   "ip_us": 380.1,
+   "ip_cycles": 38010,
+   "detect_c_ns_per_token": 3.43
+  }
+ ]
+}

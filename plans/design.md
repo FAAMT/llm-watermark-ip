@@ -1,3 +1,8 @@
+> **Historical.** Working detail written before the build. The interface as
+> built is `docs/interface.md` (its error codes and DETECT rules differ from the
+> table below), the verification as run is `docs/verification.md`, and the
+> resource estimate as built is in `docs/architecture.md`.
+
 # Design: Watermarking Sampler, working detail
 
 The detail behind `plans/initial_plan.md`: wire formats, error codes, word

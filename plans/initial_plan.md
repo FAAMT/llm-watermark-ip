@@ -1,3 +1,8 @@
+> **Historical.** This is the initial plan as submitted on 2026-11-20. What was
+> built is described in `README.md`; the differences (RTL instead of HLS, the
+> error codes, the model used for testing, MASK not built) are listed in
+> `docs/architecture.md` under "Choices that differ from the plan".
+
 # Initial Plan: Watermarking Sampler for LLM Text
 
 Repository: https://github.com/FAAMT/llm-watermark-ip
