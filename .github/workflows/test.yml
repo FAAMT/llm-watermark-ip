@@ -1,0 +1,16 @@
+# Runs the verification suite on every push: golden model self-test, unit tests,
+# the scenario and error suite (five configurations), chi-square sampling checks
+# through the RTL, and the latency measurement.
+name: test
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get update && sudo apt-get install -y iverilog
+      - run: pip install numpy scipy
+      - run: make test

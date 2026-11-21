@@ -65,7 +65,7 @@ value is int18; S is uint32 Q21.11; g and N are uint32.
 | code | name | when |
 |---|---|---|
 | 1 | BAD_CMD | unknown command code |
-| 2 | BAD_PARAM | CONFIG with V = 0 or V > 2^24, k outside 1–4, scheme > 1, θ = 0, δ ≤ 0 or δ ≥ 16.0 |
+| 2 | BAD_PARAM | CONFIG with V = 0 or V ≥ 2^24, k outside 1–4, scheme > 1, θ = 0, δ ≤ 0 or δ ≥ 16.0 |
 | 3 | BAD_SIZE | DETECT with T = 0 or T > 2^24 |
 | 4 | NO_CONFIG | SAMPLE or DETECT before any CONFIG in this activation |
 | 5 | TLAST_EARLY | a data burst ends before its declared length |
@@ -84,7 +84,21 @@ an open output burst to close.
 | DETECT | ⌈T/2⌉ + 19 cycles |
 | CONFIG | four header words, no response |
 
-The IP accepts one data beat per cycle whenever `s_axis_tvalid` is high, apart
-from the single cycle at the start of each burst in which its datapath resets.
-It never drops data under backpressure: the response waits in place until
-`m_axis_tready` rises.
+Within a data burst the IP accepts one beat per cycle whenever `s_axis_tvalid` is
+high. `s_axis_tready` is low between a SAMPLE header and its first logit beat
+(12 cycles: the seeds, then the core's start cycle), for one cycle before a
+DETECT burst, and while a response is being written. It never drops data under
+backpressure: the response waits in place until `m_axis_tready` rises.
+
+## Host side (intended integration, not built)
+
+On a PYNQ-Z2, an AMD AXI DMA would carry the streams: one MM2S transfer per
+header and one per data burst, since the IP expects TLAST on the last word of
+each, and one S2MM transfer per response. The testbench models exactly this
+packetisation. The PYNQ driver and block design were not built: the project was
+verified in simulation, which the course accepts.
+
+S, g and N add across texts, so a host scoring a long document can split it
+into several DETECT commands and sum the results. That also keeps S below its
+2^32 wrap, which a single DETECT reaches after about 2 million tokens of
+average score.

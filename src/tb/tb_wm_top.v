@@ -11,6 +11,7 @@
 //                 L <act> <cycle>                      data word with TLAST accepted
 //                 Z <act> <cycle>                      response TLAST accepted
 //                 S <act> <halted> <err> <tx_id> <ncmd> <cycles>   status after ap_done
+//                 C <act> <first CTRL poll> <CTRL after ap_done>  control register bits
 // Plusargs: +in= +out= +seed= +bubble=<0-99> +stall=<0-99> +maxcyc=
 `timescale 1ns/1ps
 module tb_wm_top;
@@ -80,7 +81,7 @@ module tb_wm_top;
                 end
             end
             s_tvalid = 0;
-            if (!kernel_done || 1) next_line;
+            next_line;
         end
         s_tvalid = 0;
         while (have_line && ln_act == cur_act) next_line;   // host resets the stream path
@@ -108,7 +109,7 @@ module tb_wm_top;
         end
     endtask
 
-    reg [31:0] r, st, er, tx, nc; reg [63:0] t0;
+    reg [31:0] r, r0, st, er, tx, nc, cf; reg [63:0] t0; integer np;
     initial begin
         if (!$value$plusargs("in=%s", fin)) fin = "build/in.txt";
         if (!$value$plusargs("out=%s", fout)) fout = "build/out.txt";
@@ -124,15 +125,19 @@ module tb_wm_top;
             cur_act = ln_act; kernel_done = 0; t0 = cyc;
             axil_write(6'h00, 32'd1);
             -> feed_ev;
-            r = 0;
+            r = 0; np = 0;
             while (!r[1]) begin
                 axil_read(6'h00, r);
+                if (np == 0) r0 = r;
+                np = np + 1;
                 if (cyc > maxcyc) begin $display("TIMEOUT act %0d", cur_act); $fclose(fo); $finish; end
             end
             kernel_done = 1;
             wait (!feed_busy);
             axil_read(6'h10, st); axil_read(6'h14, er); axil_read(6'h18, tx); axil_read(6'h1C, nc);
+            axil_read(6'h00, cf);
             $fwrite(fo, "S %0d %0d %0d %0d %0d %0d\n", cur_act, st[0], er, tx, nc, cyc - t0);
+            $fwrite(fo, "C %0d %0d %0d\n", cur_act, r0, cf);
             repeat (2) @(posedge clk);
         end
         $fclose(fo);

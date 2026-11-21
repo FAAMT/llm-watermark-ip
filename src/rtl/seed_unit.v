@@ -1,7 +1,8 @@
 // seed_unit: once per SAMPLE, the keyed seed s = fmix64(fold(K, context)) and
 // the unkeyed seed s_f = fmix64(nonce ^ (step + 1) * C_3). One fmix64 pipeline
 // is shared: the keyed input enters one cycle before the free one.
-// ready rises 4 + LAT64 cycles after start. Golden: step_seed(), free_seed().
+// ready is visible 5 + LAT64 = 10 cycles after start (the keyed fold is ready one
+// cycle before it is fed: a spare cycle). Golden: step_seed(), free_seed().
 module seed_unit #(parameter MUL_REG = 1) (
     input  wire        clk,
     input  wire        rst,

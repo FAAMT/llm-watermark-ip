@@ -60,7 +60,6 @@ module fmix32_pipe #(parameter MUL_REG = 1) (
 );
     localparam [31:0] M1 = 32'h85EBCA6B;
     localparam [31:0] M2 = 32'hC2B2AE35;
-    localparam integer LAT = 3 + 2 * MUL_REG;
     reg  [31:0] p1, p2;
     wire [31:0] p1d, p2d;
     wire [31:0] a = din ^ (din >> 16);
@@ -80,7 +79,6 @@ module fmix64_pipe #(parameter MUL_REG = 1) (
 );
     localparam [63:0] M1 = 64'hFF51AFD7ED558CCD;
     localparam [63:0] M2 = 64'hC4CEB9FE1A85EC53;
-    localparam integer LAT = 3 + 2 * MUL_REG;
     reg  [63:0] p1, p2;
     wire [63:0] p1d, p2d;
     wire [63:0] a = din ^ (din >> 33);

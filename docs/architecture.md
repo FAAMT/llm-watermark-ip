@@ -3,6 +3,22 @@
 How the IP is built: the modules, the pipelines with their latencies, where
 parallelism comes from, and what it costs in resources. Source: `src/rtl/`.
 
+```mermaid
+flowchart LR
+    PS[PS / AXI DMA] -- "AXI4-Stream 64-bit: commands + data" --> CTL[wm_top controller]
+    PS <-- "AXI4-Lite: ap_start, status" --> AXL[axil_ctrl]
+    AXL --- CTL
+    CTL -- "K, nonce, step, context" --> SEED[seed_unit<br/>ctx_fold + fmix64]
+    SEED -- "s, s'" --> SC
+    CTL -- "logit beats, 4 per cycle" --> SC[sample_core<br/>4 lanes: 2 x fmix32, green, pf_index,<br/>Gumbel ROM x2, add, max tree, running max]
+    CTL -- "token beats, 2 per cycle" --> DC[detect_core<br/>ctx_shift, 2 lanes: ctx_fold, fmix64, fmix32,<br/>green, pf_index, score ROM, score_acc]
+    SC -- "token, value" --> RESP[response words]
+    DC -- "S, g, N" --> RESP
+    RESP -- "AXI4-Stream 64-bit" --> PS
+```
+
+The same, as text:
+
 ```
  s_axis ─► wm_top controller ──CONFIG regs──────────────────────────────────────────────┐
  (64-bit)    │ header parse, error checks, burst count                                      │
@@ -22,7 +38,7 @@ parallelism comes from, and what it costs in resources. Source: `src/rtl/`.
 |---|---|---|---|---|
 | `wm_top` | `wm_top.v` | controller FSM: header parse, error checks in course order, CONFIG storage, burst counting, sequencing, response | — | the command layer of `scripts/wmtb.py` |
 | `axil_ctrl` | `axil_ctrl.v` | AXI4-Lite control and status registers | 1 | — |
-| `seed_unit` | `seed_unit.v` | keyed seed s and unkeyed seed s_f once per SAMPLE, sharing one fmix64 | ready about 9 cycles after start | `step_seed`, `free_seed` |
+| `seed_unit` | `seed_unit.v` | keyed seed s and unkeyed seed s_f once per SAMPLE, sharing one fmix64 | ready 10 cycles after start | `step_seed`, `free_seed` |
 | `sample_core` | `sample_core.v` | hash_lanes, rom_index, Gumbel ROM, add_argmax for P = 4 lanes | 10 cycles from beat to running max | `uniforms`, `green`, `pf_index`, `sample` |
 | `detect_core` | `detect_core.v` | ctx_shift, two detect lanes, shared score ROM, score_acc | 15 cycles from beat to accumulators | `detect` |
 | `fmix32_pipe` | `wm_util.v` | MurmurHash3 32-bit finaliser | 3 + 2·MUL_REG = 5 | `fmix32` |
@@ -73,6 +89,26 @@ plus the history.
 Every token's seed depends only on tokens already in the input, so the two lanes
 never wait on each other and DETECT also runs at II = 1.
 
+## Where the fixed overheads come from
+
+SAMPLE takes ⌈V/4⌉ + 26 cycles from its first header word to its last response
+word (results/perf.md), made up of:
+
+| part | cycles |
+|---|---|
+| header words 2 and 3 | 2 |
+| FSM to seed_unit | 1 |
+| seed_unit: fold, fmix64 for s, then for s′ | 10 |
+| FSM to sample_core; the start cycle, with `tready` low | 2 |
+| logit beats, one per cycle: ⌈V/4⌉ − 1 after the first | ⌈V/4⌉ − 1 |
+| pipeline: last beat to running maximum | 10 |
+| response: header and payload | 2 |
+| **total beyond ⌈V/4⌉** | **26** |
+
+DETECT takes ⌈T/2⌉ + 19: the start cycle 1, the FSM 1, beats ⌈T/2⌉ − 1, the
+15-cycle lane pipeline, and 3 response words. One seed_unit cycle is spare: the
+keyed fold is ready one cycle before it is fed.
+
 ## Parallelism and its limit
 
 - **SAMPLE is bandwidth-bound.** Every logit must cross the 64-bit stream once,
@@ -82,9 +118,17 @@ never wait on each other and DETECT also runs at II = 1.
   12,565-cycle estimate.
 - **DETECT is bandwidth-bound too**, at two tokens per beat: 1.995 tokens per
   cycle measured at T = 16,384.
-- **Pipelining** puts a register after every multiply (`MUL_REG = 1`) so the
-  synthesiser can absorb it into the DSP48E1's M and P registers; `MUL_REG` is a
-  parameter, raised if timing needs more.
+- **Pipelining.** Every fmix multiply (26 of the 41 multipliers) has a register
+  after it plus `MUL_REG` more, so the synthesiser can pack them into the
+  DSP48E1's M and P registers. `MUL_REG` is a parameter; the full scenario suite
+  passes unchanged at `MUL_REG` = 0, 1, 2 and 3 (results/rtl_tests.md), so depth
+  can be traded for clock speed without touching anything else.
+- **Likely critical paths**, to be confirmed by synthesis: the 15 multiplies that
+  do multiply-and-add in a single stage. These are the 12 in `ctx_fold`, the
+  32 × 64 free-seed multiply in `seed_unit` and the two token multiplies in
+  `detect_core`. The seed_unit's inputs hold still for the whole computation, so a
+  multicycle constraint covers it; the fold in the detect lanes would get a
+  `MUL_REG` stage like the fmix multiplies.
 - **Memory:** the two 16,896-entry tables live in block RAM. Dual ports let two
   lanes share one copy, so P = 4 needs two Gumbel ROM copies, and DETECT's two
   lanes need one score ROM copy.
@@ -105,7 +149,10 @@ in `results/synth/`. Until then, this is a structural count from the RTL.
 | **total** | | **41** | | **≈ 167 of 220** |
 
 The per-multiply figures count 24-bit × 17-bit unsigned partial products and drop
-the ones that land entirely above the output width.
+the ones that land entirely above the output width. Vivado may map some
+constant multiplies to LUTs instead; only synthesis settles it.
+The BRAM count assumes each 16,896 × 16 table packs into eight 2K × 18 RAMB36 and
+one RAMB18.
 
 | memory | entries × width | copies | RAMB36 each | RAMB36 |
 |---|---|---|---|---|

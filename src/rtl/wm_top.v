@@ -132,7 +132,8 @@ module wm_top #(
     wire signed [15:0] w3_delta = s_axis_tdata[47:32];
     wire [2:0]         w3_k     = s_axis_tdata[50:48];
     wire [1:0]         w3_sch   = s_axis_tdata[57:56];
-    wire cfg_bad = (p32 == 32'd0) || (p32 > 32'h0100_0000) || (w3_k == 3'd0) || (w3_k > 3'd4) ||
+    // V < 2^24: token ids, and sample_core's index compare, are 24 bits wide
+    wire cfg_bad = (p32 == 32'd0) || (p32 > 32'h00FF_FFFF) || (w3_k == 3'd0) || (w3_k > 3'd4) ||
                    (w3_sch > 2'd1) || (w3_theta == 32'd0) || (w3_delta <= 16'sd0) ||
                    (w3_delta >= 16'sd4096);
 

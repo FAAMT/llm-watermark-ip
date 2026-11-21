@@ -51,6 +51,12 @@ def post(path, body, tries=8):
                                          headers={"Content-Type": "application/json"})
             with urllib.request.urlopen(req, timeout=120) as r:
                 return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            if e.code == 500 and b"Failed to parse input" in e.read():
+                raise ValueError("partial UTF-8 token at the end of the prompt")
+            if i == tries - 1:
+                raise
+            time.sleep(2 ** i)
         except (urllib.error.URLError, TimeoutError, ConnectionError):
             if i == tries - 1:
                 raise
@@ -63,10 +69,14 @@ def prompt_ids(text):
 
 
 def top(ids):
-    d = post("/completion", {"prompt": ids, "n_predict": 1, "n_probs": K, "post_sampling_probs": False,
-                             "cache_prompt": True, "temperature": 1.0})
-    t = d["completion_probabilities"][0]["top_logprobs"]
-    return np.array([x["id"] for x in t]), np.array([x["logprob"] for x in t])
+    for _ in range(3):
+        d = post("/completion", {"prompt": ids, "n_predict": 1, "n_probs": K, "post_sampling_probs": False,
+                                 "cache_prompt": True, "temperature": 1.0})
+        if d.get("completion_probabilities"):
+            t = d["completion_probabilities"][0]["top_logprobs"]
+            return np.array([x["id"] for x in t]), np.array([x["logprob"] for x in t])
+        time.sleep(1)
+    return None, None                      # no distribution returned: the text ends here
 
 
 def generate(job):
@@ -75,8 +85,26 @@ def generate(job):
     nonce = int(rng.integers(0, 2**63))                     # fresh nonce per generation
     ids = prompt_ids(PROMPTS[pi])
     gen, steps, seen = [], [], set()
+    prev = None
     for step in range(L):
-        tid, lp = top(ids + gen)
+        try:
+            tid, lp = top(ids + gen)
+        except ValueError:
+            # llama.cpp rejects a prompt ending in an incomplete UTF-8 byte token. Only plain
+            # sampling can hit this (every watermarked text finished): redraw that step
+            # without the offending token.
+            if scheme != "plain" or prev is None:
+                break
+            bad = gen.pop(); steps.pop()
+            ptid, px = prev
+            keep = ptid != bad
+            p = np.exp(px[keep] - px[keep].max()); t = int(ptid[keep][rng.choice(keep.sum(), p=p / p.sum())])
+            steps.append(dict(ctx=(ids + gen)[-k:], ids=ptid.tolist(), q=[], free=False, tok=t,
+                              lp=float(prev_lp[list(ptid).index(t)]), redrawn=True))
+            gen.append(t)
+            continue
+        if tid is None:
+            break
         x = lp / temp
         q = np.round(np.clip(x - x.max(), -128, 127) * 256).astype(np.int16)
         ctx = (ids + gen)[-k:]
@@ -84,6 +112,7 @@ def generate(job):
         seen.add(tuple(ctx))
         if scheme == "plain":
             p = np.exp(x - x.max()); t = int(tid[rng.choice(len(tid), p=p / p.sum())])
+            prev, prev_lp = (tid, x), lp
         else:
             lg = np.full(V, -32768, np.int16); lg[tid] = q
             t, _ = W.sample(KEY, ctx, lg, W.GUMBEL if scheme == "gumbel" else W.GREEN, GAMMA, DELTA_Q,
@@ -121,7 +150,8 @@ def main():
     OUT.mkdir(parents=True, exist_ok=True)
     jobs = [(s, k, t, pi, 1000 * i + pi) for i, (s, k, t) in enumerate(
         [(s, k, t) for s in ("gumbel", "green") for k in (1, 2, 4) for t in (0.7, 1.0)] +
-        [("plain", k, t) for k in (1,) for t in (0.7, 1.0)]) for pi in range(len(PROMPTS))]
+        [("plain", k, t) for k in (1,) for t in (0.7, 1.0)] +
+        [(s, 2, 1.5) for s in ("gumbel", "green", "plain")]) for pi in range(len(PROMPTS))]
     # resumable: every finished text is appended at once, and a rerun skips them
     path = OUT / "texts.jsonl"
     done = {}
@@ -146,11 +176,17 @@ def main():
 
     rows = []
     for r in texts:
-        k = r["k"] if r["scheme"] != "plain" else 1
+        k = r["k"] if r["scheme"] != "plain" else 2 if r["temp"] == 1.5 else 1
         sc, gr = scores(KEY, r["tokens"], k)
         pS, pg, nS, ng = pvals(sc, gr)
+        ent = []
+        for st in r["steps"]:
+            if st["q"]:
+                q = np.array(st["q"]) / 256.0; pp = np.exp(q - q.max()); pp /= pp.sum()
+                ent.append(float(-(pp * np.log(pp + 1e-300)).sum()))
         rows.append(dict(scheme=r["scheme"], k=r["k"], temp=r["temp"], prompt=r["prompt"], T=len(r["tokens"]),
-                         N=len(sc), pS=pS, pg=pg, firstS=nS, firstg=ng,
+                         N=len(sc), pS=pS, pg=pg, firstS=nS, firstg=ng, Ssum=int(sc.sum()), gsum=int(gr.sum()),
+                         ent=float(np.mean(ent)) if ent else None,
                          nll=-float(np.mean([s["lp"] for s in r["steps"]])),
                          free=float(np.mean([s["free"] for s in r["steps"]]))))
     # null: plain text under the right key, every text under 20 wrong keys
@@ -167,6 +203,21 @@ def main():
                                     ks_g=float(kstest(null_g, "uniform").pvalue),
                                     fp_S=int(np.sum(np.array(null_S) < 1e-3)), fp_g=int(np.sum(np.array(null_g) < 1e-3)),
                                     min_S=float(min(null_S)), min_g=float(min(null_g))))
+    # prediction check: the green rate GREEN should produce, from the recorded distributions,
+    # against the rate it did produce, at generation time (every step, with its own context)
+    chk = []
+    for s_, k_, t_ in [(s_, k_, t_) for s_ in ("green",) for k_ in (1, 2, 4) for t_ in (0.7, 1.0, 1.5)]:
+        exp_g, obs_g = [], []
+        for r in texts:
+            if (r["scheme"], r["k"], r["temp"]) != (s_, k_, t_): continue
+            for st in r["steps"]:
+                ids = np.array(st["ids"]); q = np.array(st["q"]) / 256.0
+                gr = W.green(W.uniforms(W.step_seed(KEY, st["ctx"]), ids), W.green_thr(GAMMA))
+                pb = np.exp(q - q.max() + (DELTA_Q / 256) * gr); pb /= pb.sum()
+                exp_g.append(float(pb[gr].sum())); obs_g.append(bool(gr[list(ids).index(st["tok"])]))
+        if exp_g:
+            chk.append(dict(k=k_, temp=t_, steps=len(obs_g), expected=float(np.mean(exp_g)), observed=float(np.mean(obs_g))))
+    res["green_check"] = chk
     (ROOT / "results" / "llm_eval.json").write_text(json.dumps(res, indent=1))
     report(res)
 
@@ -182,16 +233,25 @@ def report(res):
            "Generated by `python3 scripts/llm_eval.py`. Model: Qwen3-Coder-30B-A3B-Instruct (Q4_K_M, V = 151,936),",
            f"served by llama.cpp on this machine. Top-{K} sampling, {L}-token limit, six prompts per setting,",
            f"γ = {GAMMA}, δ = {DELTA_Q / 256}. Tokens are chosen by the golden model, which the RTL matches bit for",
-           "bit (results/llm_rtl_replay.md). Detection sees only the generated tokens, not the prompt.", "",
-           "| scheme | k | temperature | texts detected at p < 10⁻⁶ (Gumbel score) | (green count) | median tokens to detect, Gumbel | median tokens to detect, green | mean NLL per token | free steps |",
-           "|---|---|---|---|---|---|---|---|---|"]
+           "bit (results/llm_rtl_replay.md). Detection sees only the generated tokens, not the prompt, and skips",
+           "repeated contexts.", "",
+           "| scheme | k | temp. | entropy, nats/token | mean score per token (null 1.000) | green rate (null 0.250) | single texts detected, Gumbel / green | six texts pooled: p, Gumbel | pooled p, green | tokens needed for p < 10⁻⁶, Gumbel / green | NLL per token | free steps |",
+           "|---|---|---|---|---|---|---|---|---|---|---|---|"]
     keys = sorted({(r["scheme"], r["k"], r["temp"]) for r in rows}, key=lambda x: (["gumbel", "green", "plain"].index(x[0]), x[1], x[2]))
+    Z6 = 4.753                                         # one-sided z for p = 1e-6
     for s, k, t in keys:
         g = [r for r in rows if (r["scheme"], r["k"], r["temp"]) == (s, k, t)]
-        det_S = sum(r["pS"] < 1e-6 for r in g); det_g = sum(r["pg"] < 1e-6 for r in g)
-        out.append(f"| {s.upper() if s != 'plain' else 'plain'} | {k if s != 'plain' else '—'} | {t} | {det_S} of {len(g)} | {det_g} of {len(g)} | "
-                   f"{med([r['firstS'] for r in g])} | {med([r['firstg'] for r in g])} | "
-                   f"{np.mean([r['nll'] for r in g]):.3f} | {100 * np.mean([r['free'] for r in g]):.0f} % |")
+        N = sum(r["N"] for r in g); S = sum(r["Ssum"] for r in g) / 2048; G = sum(r["gsum"] for r in g)
+        m, f = S / N, G / N
+        pS = gammaincc(N, S); pg = binom.sf(G - 1, N, GAMMA)
+        nS = f"{(Z6 / (m - 1)) ** 2:,.0f}" if m > 1.0 else "—"
+        ng = f"{(Z6 * math.sqrt(GAMMA * (1 - GAMMA)) / (f - GAMMA)) ** 2:,.0f}" if f > GAMMA else "—"
+        ents = [r["ent"] for r in g if r["ent"] is not None]
+        name = s.upper() if s != "plain" else "plain"
+        out.append(f"| {name} | {k if s != 'plain' else '—'} | {t} | {np.mean(ents):.2f} | {m:.3f} | {f:.3f} | "
+                   f"{sum(r['pS'] < 1e-6 for r in g)} / {sum(r['pg'] < 1e-6 for r in g)} of {len(g)} | "
+                   f"{pS:.1e} | {pg:.1e} | {nS} / {ng} | {np.mean([r['nll'] for r in g]):.3f} | "
+                   f"{100 * np.mean([r['free'] for r in g]):.0f} % |")
     n = res["null"]
     out += ["", "## False positives", "",
             f"{n['n']} null p-values: every text scored under 20 wrong keys, plus the plain texts under the right key.", "",
@@ -199,8 +259,26 @@ def report(res):
             "|---|---|---|---|",
             f"| Gumbel score | {n['min_S']:.2g} | {n['fp_S']} | {n['ks_S']:.2f} |",
             f"| green count | {n['min_g']:.2g} | {n['fp_g']} | {n['ks_g']:.2f} |", "",
-            "Mean NLL is the model's own negative log-probability of the chosen tokens, at temperature 1;",
-            "a distortion-free scheme should match plain sampling at the same temperature."]
+            "The binomial p-value of the green count is discrete, so its null p-values sit above the uniform",
+            "line rather than on it: the Kolmogorov–Smirnov test against a continuous uniform rejects it even",
+            f"though it is conservative, and its false-positive count ({n['fp_g']}) is within the expected {n['n'] / 1000:.1f}.", "",
+            "## Does GREEN steer as designed?", "",
+            "The green rate GREEN should produce at each step follows from the recorded top-100 distribution",
+            "with δ added to the green tokens. Expected against observed, over every generation step:", "",
+            "| k | temperature | steps | expected green rate | observed |", "|---|---|---|---|---|"]
+    out += [f"| {c['k']} | {c['temp']} | {c['steps']} | {c['expected']:.3f} | {c['observed']:.3f} |" for c in res.get("green_check", [])]
+    out += ["", "## Reading the table", "",
+            "- **The signal per token scales with entropy.** This instruct model is very confident: 0.2–0.4",
+            "  nats per token at temperature 0.7–1.0, so a 200-token answer leaves little room to steer, and",
+            "  most single texts stay above the 10⁻⁶ bar. Pooling a setting's six texts, or raising the",
+            "  temperature, crosses it. The tokens-needed column projects the length at which one text would.",
+            "- **GREEN steers exactly as predicted** (table above): what limits it is the model's entropy, not",
+            "  the hardware or the scheme.",
+            "- **GUMBEL needs fewer tokens than GREEN at δ = 2 in every setting here**, comparing each scheme's",
+            "  better statistic, and it does so without biasing the distribution.",
+            "- **NLL** is the model's own negative log-probability of the chosen tokens at temperature 1. Six",
+            "  texts per setting are too few to measure distortion: the spread between prompts is as large as",
+            "  the differences between schemes."]
     (ROOT / "results" / "llm_eval.md").write_text("\n".join(out) + "\n")
     print("\n".join(out[6:]))
 

@@ -48,7 +48,34 @@ Verilog) against a bit-exact Python golden model, `src/golden/wm_ref.py`.
 
 ## Results against the plan's goals
 
-RESULTS_TABLE
+| goal from the initial plan | target | result | file |
+|---|---|---|---|
+| bit-exact with the golden model | every word | unit tests 4 of 4 blocks, 80,320 vectors; scenario and error suite 50 of 50 activations in five configurations; 80 real-model steps at V = 151,936 | results/unit_tests.md, results/rtl_tests.md, results/llm_rtl_replay.md |
+| tests that catch bugs | — | 29 of 29 planted bugs caught | results/mutations.md |
+| GUMBEL samples softmax(ℓ) | χ² passes | p = 0.19 over 20,000 RTL samples | results/stats_rtl.md |
+| GREEN samples softmax(ℓ + δ·green) | χ² passes | p = 0.74 over 20,000 RTL samples | results/stats_rtl.md |
+| SAMPLE latency, V = 50,257 | 12,565 cycles, about 126 µs at 100 MHz | 12,591 cycles, 125.9 µs | results/perf.md |
+| initiation interval | one beat (4 logits or 2 tokens) per cycle | met: latency − beats is constant from V = 4 to 151,936 | results/perf.md |
+| DETECT throughput | 2 tokens per cycle | 1.995 at T = 16,384 | results/perf.md |
+| detector false positives | uniform null p-values | 2 of 2,058 below 10⁻³, against 2.1 expected | results/llm_eval.md |
+| detection on real text | — | GUMBEL detects in about 36 to 2,000 tokens depending on the model's entropy; GREEN needs 1.6 to 6.3 times more | results/llm_eval.md |
+| DSP48E1, BRAM | about 110–150 DSP, 27 RAMB36 | about 167 DSP and 25.5 RAMB36 by structural count; **synthesis not run** | docs/architecture.md |
+| clock | 100 MHz | **not verified**: no synthesis tool on the build machine; `make synth-vivado` is ready | syn/ |
+
+Software comparison: a gcc -O3 loop on one desktop core takes 135 µs for the same
+V = 50,257 SAMPLE (results/baseline.md). The IP at 100 MHz matches it at about
+1/50 of the clock, and frees the processor from the per-token pass over the
+whole vocabulary.
+
+## What changed from the plan
+
+The plan said Vitis HLS. The build machine has no Vitis, so the IP was written as
+Verilog RTL, which the course accepts and which could be simulated cycle by
+cycle here. The error codes follow the course's command-response rules rather
+than the plan's table. The test model is Qwen3-Coder-30B-A3B from the local
+llama.cpp server, because GPT-2 could not be installed. The MASK stretch command
+was not built. Details: docs/architecture.md, "Choices that differ from the
+plan".
 
 ## Reproduce
 

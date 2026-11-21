@@ -32,6 +32,7 @@ class Activation:
     def __init__(self):
         self.words = []          # (hdr, last, data)
         self.expect = []         # response words, in order
+        self.expect_last = []    # TLAST of each response word: on the last payload word only
         self.cfg = None
         self.ncmd = 0
         self.status = None       # (halted, err, txid, ncmd), set by end() or error()
@@ -71,6 +72,7 @@ class Activation:
                             c["scheme"], c["gamma"], c["delta_q"], free=free, nonce=c["nonce"], step=step,
                             theta=c["theta"])
             self.expect += [hdr0(CMD_SAMPLE, txid, 1), (t & 0xFFFFFF) | ((v & M32) << 32)]
+            self.expect_last += [0, 1]
             self.ncmd += 1
             self.last_sample = (t, v)
         self.meta.append(("SAMPLE", txid, nb))
@@ -91,6 +93,7 @@ class Activation:
         if predict and c is not None:
             S, g, N = W.detect(c["key"], tokens, skip, c["k"], c["gamma"], theta=c["theta"])
             self.expect += [hdr0(CMD_DETECT, txid, 2), (S & M32) | ((N & M32) << 32), g & M32]
+            self.expect_last += [0, 0, 1]
             self.ncmd += 1
             self.last_detect = (S, g, N)
         self.meta.append(("DETECT", txid, nb))
@@ -113,19 +116,25 @@ class Activation:
         return self
 
 
-def compile_tb(force=False):
+def compile_tb(force=False, mul_reg=None):
+    """Build the top-level simulation; mul_reg overrides wm_top's MUL_REG pipeline parameter."""
     BUILD.mkdir(exist_ok=True)
-    out = BUILD / "tb_wm_top.vvp"
+    tag = "" if mul_reg is None else f"_mr{mul_reg}"
+    out = BUILD / f"tb_wm_top{tag}.vvp"
     srcs = sorted((ROOT / "src" / "rtl").glob("*.v")) + [ROOT / "src" / "tb" / "tb_wm_top.v"]
+    roots = ["-s", "tb_wm_top"]
+    if mul_reg is not None:
+        dp = BUILD / f"defparam{tag}.v"
+        dp.write_text(f"module defparam{tag}; defparam tb_wm_top.dut.MUL_REG = {mul_reg}; endmodule\n")
+        srcs.append(dp); roots += ["-s", f"defparam{tag}"]
     if force or not out.exists() or any(s.stat().st_mtime > out.stat().st_mtime for s in srcs):
-        subprocess.run(["iverilog", "-g2012", "-o", str(out), "-s", "tb_wm_top", *map(str, srcs)],
-                       check=True, cwd=ROOT)
+        subprocess.run(["iverilog", "-g2012", "-o", str(out), *roots, *map(str, srcs)], check=True, cwd=ROOT)
     return out
 
 
-def run(acts, name, seed=1, bubble=0, stall=0, maxcyc=20_000_000):
+def run(acts, name, seed=1, bubble=0, stall=0, maxcyc=20_000_000, mul_reg=None):
     """Simulate the activations; return per-activation results and a pass flag."""
-    vvp = compile_tb()
+    vvp = compile_tb(mul_reg=mul_reg)
     fin, fout = BUILD / f"{name}.in.txt", BUILD / f"{name}.out.txt"
     with open(fin, "w") as f:
         for a, act in enumerate(acts):
@@ -135,12 +144,14 @@ def run(acts, name, seed=1, bubble=0, stall=0, maxcyc=20_000_000):
                         f"+bubble={bubble}", f"+stall={stall}", f"+maxcyc={maxcyc}"], cwd=ROOT, capture_output=True, text=True)
     if p.returncode != 0 or "TIMEOUT" in p.stdout:
         raise RuntimeError(p.stdout[-2000:] + p.stderr[-2000:])
-    got = {a: dict(resp=[], H=[], L=[], Z=[], status=None) for a in range(len(acts))}
+    got = {a: dict(resp=[], last=[], H=[], L=[], Z=[], status=None, ctrl=None) for a in range(len(acts))}
     for line in open(fout):
         f = line.split()
         a = int(f[1])
         if f[0] == "R":
-            got[a]["resp"].append(int(f[3], 16))
+            got[a]["resp"].append(int(f[3], 16)); got[a]["last"].append(int(f[2]))
+        elif f[0] == "C":
+            got[a]["ctrl"] = (int(f[2]), int(f[3]))
         elif f[0] == "H":
             got[a]["H"].append((int(f[2]), int(f[3], 16)))
         elif f[0] in ("L", "Z"):
@@ -151,8 +162,10 @@ def run(acts, name, seed=1, bubble=0, stall=0, maxcyc=20_000_000):
     rows, ok_all = [], True
     for a, act in enumerate(acts):
         g = got[a]
-        resp_ok = g["resp"] == [w & M64 for w in act.expect]
-        st_ok = g["status"] == act.status
+        resp_ok = g["resp"] == [w & M64 for w in act.expect] and g["last"] == act.expect_last
+        # CTRL: the first poll sees busy or done; after ap_done (read clears it) only idle is set
+        c = g["ctrl"]
+        st_ok = g["status"] == act.status and c is not None and (c[0] & 3) != 0 and c[1] == 4
         ok_all &= resp_ok and st_ok
         rows.append(dict(act=a, resp_ok=resp_ok, status_ok=st_ok, got_status=g["status"],
                          want_status=act.status, nresp=len(g["resp"]), H=g["H"], L=g["L"], Z=g["Z"],
